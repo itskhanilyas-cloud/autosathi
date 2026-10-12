@@ -17,8 +17,15 @@ const mem = new Map();
 async function table() {
   if (!CONN) return null;
   if (!client) {
-    const { TableClient } = require("@azure/data-tables");
-    client = TableClient.fromConnectionString(CONN, TABLE, { allowInsecureConnection: /=http:\/\/|UseDevelopmentStorage/i.test(CONN) });
+    const { TableClient, AzureNamedKeyCredential } = require("@azure/data-tables");
+    const val = CONN.trim();
+    if (/AccountName=|UseDevelopmentStorage/i.test(val)) {
+      client = TableClient.fromConnectionString(val, TABLE, { allowInsecureConnection: /=http:\/\/|UseDevelopmentStorage/i.test(val) });
+    } else {
+      // Only the account key was provided: connect using the account name.
+      const account = process.env.AZURE_STORAGE_ACCOUNT || "autosathirides1012";
+      client = new TableClient(`https://${account}.table.core.windows.net`, TABLE, new AzureNamedKeyCredential(account, val));
+    }
     ready = client.createTable().catch(e => { if (e.statusCode !== 409) throw e; });
   }
   await ready;
