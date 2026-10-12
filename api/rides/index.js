@@ -18,7 +18,7 @@ async function table() {
   if (!CONN) return null;
   if (!client) {
     const { TableClient } = require("@azure/data-tables");
-    client = TableClient.fromConnectionString(CONN, TABLE);
+    client = TableClient.fromConnectionString(CONN, TABLE, { allowInsecureConnection: /=http:\/\/|UseDevelopmentStorage/i.test(CONN) });
     ready = client.createTable().catch(e => { if (e.statusCode !== 409) throw e; });
   }
   await ready;
@@ -42,7 +42,9 @@ async function recentRides() {
   const since = Date.now() - DAY;
   if (!t) return [...mem.values()].filter(r => r.at > since);
   const out = [];
-  for await (const e of t.listEntities({ queryOptions: { filter: `at gt ${since}L` } })) out.push(JSON.parse(e.data));
+  for await (const e of t.listEntities({ queryOptions: { filter: `PartitionKey eq '${PK}'` } })) {
+    const r = JSON.parse(e.data); if (r.at > since) out.push(r);
+  }
   return out;
 }
 
@@ -125,6 +127,6 @@ module.exports = async function (context, req) {
     context.res = json(405, { error: "Not allowed" });
   } catch (e) {
     context.log.error(e);
-    context.res = json(500, { error: "Server error" });
+    context.res = json(500, { error: "Server error", detail: String(e.code || e.statusCode || e.name || "") + ": " + String(e.message || "").split("\n")[0].slice(0, 160) });
   }
 };
