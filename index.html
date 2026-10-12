@@ -55,6 +55,7 @@ footer{text-align:center;color:var(--muted);font-size:12px;padding:20px}
 </header>
 
 <main>
+<p id="net" class="card hidden" role="status" style="color:var(--warn)">Can't reach AutoSathi servers. Retrying…</p>
 <!-- RIDER -->
 <section id="rider">
   <div class="card" id="bookCard">
@@ -81,6 +82,7 @@ footer{text-align:center;color:var(--muted);font-size:12px;padding:20px}
       <h2 style="margin:0">Your ride</h2><span class="pill" id="tripPill"></span>
     </div>
     <p class="muted" id="tripRoute"></p>
+    <p class="muted hidden" id="waitHint">Waiting for a nearby driver to accept…</p>
     <div id="driverBox" class="hidden">
       <p style="margin:6px 0"><b id="dName"></b> · <span id="dAuto"></span></p>
       <p class="muted" style="margin:0">Share this OTP with your driver</p>
@@ -89,6 +91,7 @@ footer{text-align:center;color:var(--muted);font-size:12px;padding:20px}
     <ul class="steps" id="steps"></ul>
     <button class="btn ghost" id="cancelBtn">Cancel ride</button>
     <button class="btn hidden" id="newBtn">Book another ride</button>
+    <p class="muted" id="tripErr" role="alert"></p>
   </div>
 
   <div class="card">
@@ -117,7 +120,7 @@ footer{text-align:center;color:var(--muted);font-size:12px;padding:20px}
   </div>
 </section>
 </main>
-<footer>AutoSathi demo · rides are stored in this browser · open Driver in another tab to accept rides</footer>
+<footer>AutoSathi · riders and drivers see the same live rides</footer>
 
 <script>
 const CITIES={
@@ -127,97 +130,114 @@ const CITIES={
   "Pune":{"Shivajinagar":[18.5308,73.8475],"Kothrud":[18.5074,73.8077],"Hinjewadi":[18.5912,73.7389],"Viman Nagar":[18.5679,73.9143],"Swargate":[18.5018,73.8636],"Baner":[18.559,73.7868]}
 };
 const STEPS=["Searching for a driver","Driver on the way","Ride started","Ride completed"];
-const KEY="autosathi.rides.v1",DKEY="autosathi.driver.v1";
 const $=id=>document.getElementById(id);
 const load=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch{return d}};
 const save=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}};
-let rides=load(KEY,[]);
-let myRideId=load("autosathi.mine",null);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(path,body){
+  const r=await fetch("/api/"+path,body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{cache:"no-store"});
+  const j=await r.json().catch(()=>({error:"Server not reachable"}));
+  if(!r.ok)throw new Error(j.error||"Something went wrong");return j;}
+function net(ok){$("net").classList.toggle("hidden",ok)}
 
 function km(a,b){const R=6371,t=x=>x*Math.PI/180,dLa=t(b[0]-a[0]),dLo=t(b[1]-a[1]);
   const h=Math.sin(dLa/2)**2+Math.cos(t(a[0]))*Math.cos(t(b[0]))*Math.sin(dLo/2)**2;
   return 2*R*Math.asin(Math.sqrt(h))*1.3;} // 1.3 = road factor
 function fare(d){return Math.round(d<=1.5?30:30+(d-1.5)*15);} // ₹30 min for 1.5 km, ₹15/km after
 
-function fillCity(){const c=$("city");c.innerHTML=Object.keys(CITIES).map(x=>`<option>${x}</option>`).join("");fillPlaces();}
+// ---------- RIDER ----------
+let mine=load("autosathi.myride",null); // {id, token}
+let ride=null, rideHistory=load("autosathi.history",[]);
+function fillCity(){$("city").innerHTML=Object.keys(CITIES).map(x=>`<option>${x}</option>`).join("");fillPlaces();}
 function fillPlaces(){const p=Object.keys(CITIES[$("city").value]).map(x=>`<option>${x}</option>`).join("");
   $("from").innerHTML=p;$("to").innerHTML=p;$("to").selectedIndex=1;quote();}
 function quote(){const C=CITIES[$("city").value],f=$("from").value,t=$("to").value;
   if(f===t){$("dist").textContent="Pick a different drop";$("price").textContent="₹0";$("bookBtn").disabled=true;return}
   const d=km(C[f],C[t]);$("dist").textContent=`${d.toFixed(1)} km · ~${Math.max(5,Math.round(d*3.5))} min`;
   $("price").textContent="₹"+fare(d);$("bookBtn").disabled=false;}
-["city"].forEach(i=>$(i).onchange=fillPlaces);["from","to"].forEach(i=>$(i).onchange=quote);
+$("city").onchange=fillPlaces;["from","to"].forEach(i=>$(i).onchange=quote);
+$("name").value=load("autosathi.name","");$("phone").value=load("autosathi.phone","");
 
-$("bookBtn").onclick=()=>{
+$("bookBtn").onclick=async()=>{
   const name=$("name").value.trim(),phone=$("phone").value.trim();
   if(!name){$("err").textContent="Please enter your name.";return}
   if(!/^[6-9]\d{9}$/.test(phone)){$("err").textContent="Enter a valid 10-digit Indian mobile number.";return}
-  $("err").textContent="";
   const C=CITIES[$("city").value],d=km(C[$("from").value],C[$("to").value]);
-  const r={id:Date.now().toString(36),city:$("city").value,from:$("from").value,to:$("to").value,km:+d.toFixed(1),fare:fare(d),
-    pay:$("pay").value,name,phone,status:0,otp:String(1000+Math.floor(Math.random()*9000)),at:Date.now(),driver:null,cancelled:false};
-  rides.unshift(r);save(KEY,rides);myRideId=r.id;save("autosathi.mine",r.id);render();
-  // If no driver accepts in 20s, an auto-assigned demo driver picks it up
-  setTimeout(()=>autoAssign(r.id),20000);
+  $("bookBtn").disabled=true;$("err").textContent="";
+  try{const j=await api("rides",{city:$("city").value,from:$("from").value,to:$("to").value,km:+d.toFixed(1),fare:fare(d),pay:$("pay").value,name,phone});
+    save("autosathi.name",name);save("autosathi.phone",phone);
+    mine={id:j.ride.id,token:j.token};save("autosathi.myride",mine);ride=j.ride;renderTrip();}
+  catch(e){$("err").textContent=e.message}finally{$("bookBtn").disabled=false}
 };
-function autoAssign(id){rides=load(KEY,[]);const r=rides.find(x=>x.id===id);
-  if(r&&!r.cancelled&&r.status===0){r.driver={name:"Suresh K.",auto:"KA 01 AX 4421"};r.status=1;save(KEY,rides);render();progress(id)}}
-function progress(id){ // demo: simulate trip progress once a driver is assigned
-  setTimeout(()=>step(id,1,2),12000);setTimeout(()=>step(id,2,3),24000);}
-function step(id,from,to){rides=load(KEY,[]);const r=rides.find(x=>x.id===id);if(r&&!r.cancelled&&r.status===from){r.status=to;save(KEY,rides);render()}}
-$("cancelBtn").onclick=()=>{const r=rides.find(x=>x.id===myRideId);if(r){r.cancelled=true;save(KEY,rides)}render()};
-$("newBtn").onclick=()=>{myRideId=null;save("autosathi.mine",null);render()};
-
+$("cancelBtn").onclick=async()=>{try{ride=await api(`rides/${mine.id}/cancel`,{token:mine.token});renderTrip()}catch(e){alertTrip(e.message)}};
+$("newBtn").onclick=()=>{mine=null;ride=null;save("autosathi.myride",null);renderTrip()};
+function alertTrip(m){$("tripErr").textContent=m}
+async function pollRider(){
+  if(!mine)return;
+  try{ride=await api(`rides/${mine.id}?token=${mine.token}`);net(true);
+    if((ride.cancelled||ride.status===3)&&!rideHistory.some(h=>h.id===ride.id)){rideHistory.unshift(ride);rideHistory=rideHistory.slice(0,20);save("autosathi.history",rideHistory)}
+    renderTrip();}
+  catch(e){if(/not found/i.test(e.message)){mine=null;save("autosathi.myride",null);ride=null;renderTrip()}else net(false)}
+}
 function renderTrip(){
-  const r=rides.find(x=>x.id===myRideId);
-  $("bookCard").classList.toggle("hidden",!!r);$("tripCard").classList.toggle("hidden",!r);if(!r)return;
+  const r=mine&&ride;
+  $("bookCard").classList.toggle("hidden",!!mine);$("tripCard").classList.toggle("hidden",!mine);
+  renderHistory();if(!r)return;
+  $("tripErr").textContent="";
   $("tripRoute").textContent=`${r.from} → ${r.to}, ${r.city} · ${r.km} km · ₹${r.fare} (${r.pay})`;
   const done=r.cancelled||r.status===3;
   $("tripPill").textContent=r.cancelled?"Cancelled":STEPS[r.status];$("tripPill").className="pill "+(r.cancelled?"warn":r.status===3?"ok":"");
   $("driverBox").classList.toggle("hidden",!r.driver||done);
-  if(r.driver){$("dName").textContent=r.driver.name;$("dAuto").textContent=r.driver.auto;$("otp").textContent=r.otp}
+  if(r.driver){$("dName").textContent=r.driver.name;$("dAuto").textContent=r.driver.auto;$("otp").textContent=r.otp||""}
+  $("waitHint").classList.toggle("hidden",r.status!==0||done);
   $("steps").innerHTML=r.cancelled?"":STEPS.map((s,i)=>`<li class="${i<r.status||r.status===3?"done":i===r.status?"now":""}">${s}</li>`).join("");
   $("cancelBtn").classList.toggle("hidden",done||r.status>=2);$("newBtn").classList.toggle("hidden",!done);
 }
 function renderHistory(){
-  const h=rides.filter(r=>r.cancelled||r.status===3);
-  $("history").innerHTML=h.length?h.slice(0,8).map(r=>`<div class="req"><b>${esc(r.from)} → ${esc(r.to)}</b><br><span class="muted">${new Date(r.at).toLocaleString("en-IN",{dateStyle:"medium",timeStyle:"short"})} · ₹${r.fare}</span> <span class="pill ${r.cancelled?"warn":"ok"}">${r.cancelled?"Cancelled":"Completed"}</span></div>`).join(""):`<div class="empty">No rides yet</div>`;
+  $("history").innerHTML=rideHistory.length?rideHistory.slice(0,8).map(r=>`<div class="req"><b>${esc(r.from)} → ${esc(r.to)}</b><br><span class="muted">${new Date(r.at).toLocaleString("en-IN",{dateStyle:"medium",timeStyle:"short"})} · ₹${r.fare}</span> <span class="pill ${r.cancelled?"warn":"ok"}">${r.cancelled?"Cancelled":"Completed"}</span></div>`).join(""):`<div class="empty">No rides yet</div>`;
 }
-// DRIVER
-let drv=load(DKEY,{name:"",auto:"",online:false});
-$("dn").value=drv.name;$("dv").value=drv.auto;$("online").checked=drv.online;
-["dn","dv"].forEach(i=>$(i).oninput=()=>{drv.name=$("dn").value;drv.auto=$("dv").value.toUpperCase();save(DKEY,drv)});
-$("online").onchange=()=>{if($("online").checked&&(!drv.name.trim()||!drv.auto.trim())){$("online").checked=false;alertBox("Add your name and auto number first.");return}
-  drv.online=$("online").checked;save(DKEY,drv);renderDriver()};
-function alertBox(m){$("requests").innerHTML=`<div class="empty">${m}</div>`}
-function renderDriver(){
-  const mine=rides.filter(r=>r.driver&&r.driver.name===drv.name&&r.driver.auto===drv.auto);
-  const paid=mine.filter(r=>r.status===3&&!r.cancelled);
-  $("earn").textContent="₹"+paid.reduce((s,r)=>s+r.fare,0);$("earnN").textContent=`${paid.length} ride${paid.length===1?"":"s"}`;
-  if(!drv.online){alertBox("You're offline. Go online to see ride requests.");return}
-  const active=mine.find(r=>!r.cancelled&&r.status>0&&r.status<3);
-  if(active){$("requests").innerHTML=`<div class="req"><span class="pill">${STEPS[active.status]}</span><p><b>${esc(active.name)}</b> · ${esc(active.phone)}<br>${esc(active.from)} → ${esc(active.to)} · ₹${active.fare} (${active.pay})</p>
-    ${active.status===1?`<label>Rider's OTP</label><input id="otpIn" inputmode="numeric" maxlength="4"><button class="btn" onclick="startRide('${active.id}')">Start ride</button>`:`<button class="btn" onclick="endRide('${active.id}')">Complete ride · collect ₹${active.fare}</button>`}</div>`;return}
-  const open=rides.filter(r=>!r.cancelled&&r.status===0);
-  $("requests").innerHTML=open.length?open.map(r=>`<div class="req"><b>${esc(r.from)} → ${esc(r.to)}</b> <span class="pill">${r.city}</span><br><span class="muted">${r.km} km · ${esc(r.name)} · ${r.pay}</span><div class="row"><button class="btn" onclick="accept('${r.id}')">Accept · ₹${r.fare}</button></div></div>`).join(""):`<div class="empty">Waiting for ride requests…</div>`;
-}
-function accept(id){rides=load(KEY,[]);const r=rides.find(x=>x.id===id);if(!r||r.status!==0||r.cancelled){render();return}
-  r.driver={name:drv.name,auto:drv.auto};r.status=1;save(KEY,rides);render()}
-function startRide(id){rides=load(KEY,[]);const r=rides.find(x=>x.id===id);
-  if($("otpIn").value!==r.otp){$("otpIn").style.borderColor="var(--warn)";$("otpIn").value="";$("otpIn").placeholder="Wrong OTP";return}
-  r.status=2;save(KEY,rides);render()}
-function endRide(id){rides=load(KEY,[]);const r=rides.find(x=>x.id===id);r.status=3;save(KEY,rides);render()}
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 
-function render(){rides=load(KEY,rides);renderTrip();renderHistory();renderDriver()}
+// ---------- DRIVER ----------
+let drv=load("autosathi.driver.v2",null)||{id:crypto.randomUUID?crypto.randomUUID():String(Math.random()).slice(2),name:"",auto:"",online:false};
+save("autosathi.driver.v2",drv);
+let dRides=[],dErrMsg="";
+$("dn").value=drv.name;$("dv").value=drv.auto;$("online").checked=drv.online;
+["dn","dv"].forEach(i=>$(i).oninput=()=>{drv.name=$("dn").value;drv.auto=$("dv").value.toUpperCase();save("autosathi.driver.v2",drv)});
+$("online").onchange=()=>{if($("online").checked&&(!drv.name.trim()||!drv.auto.trim())){$("online").checked=false;msg("Add your name and auto number first.");return}
+  drv.online=$("online").checked;save("autosathi.driver.v2",drv);pollDriver()};
+function msg(m){$("requests").innerHTML=`<div class="empty">${esc(m)}</div>`}
+async function pollDriver(){
+  if(!drv.online){renderDriver();return}
+  try{const j=await api(`rides?driverId=${encodeURIComponent(drv.id)}`);dRides=j.rides;net(true);renderDriver()}catch(e){net(false)}
+}
+function renderDriver(){
+  const minez=dRides.filter(r=>r.driver&&r.driver.name===drv.name&&r.driver.auto===drv.auto.toUpperCase());
+  const paid=minez.filter(r=>r.status===3&&!r.cancelled);
+  $("earn").textContent="₹"+paid.reduce((s,r)=>s+r.fare,0);$("earnN").textContent=`${paid.length} ride${paid.length===1?"":"s"} in last 24h`;
+  if(!drv.online){msg("You're offline. Go online to see ride requests.");return}
+  if(document.activeElement&&document.activeElement.id==="otpIn")return; // don't wipe OTP while typing
+  const active=minez.find(r=>!r.cancelled&&r.status>0&&r.status<3);
+  if(active){$("requests").innerHTML=`<div class="req"><span class="pill">${STEPS[active.status]}</span><p><b>${esc(active.name)}</b> · <a href="tel:${esc(active.phone)}">${esc(active.phone)}</a><br>${esc(active.from)} → ${esc(active.to)} · ₹${active.fare} (${active.pay})</p>
+    ${active.status===1?`<label for="otpIn">Rider's OTP</label><input id="otpIn" inputmode="numeric" maxlength="4"><button class="btn" onclick="act('${active.id}','start')">Start ride</button>`:`<button class="btn" onclick="act('${active.id}','complete')">Complete ride · collect ₹${active.fare}</button>`}<p class="muted" id="dErr" style="color:var(--warn)">${esc(dErrMsg)}</p></div>`;return}
+  const open=dRides.filter(r=>!r.cancelled&&r.status===0);
+  $("requests").innerHTML=open.length?open.map(r=>`<div class="req"><b>${esc(r.from)} → ${esc(r.to)}</b> <span class="pill">${esc(r.city)}</span><br><span class="muted">${r.km} km · ${esc(r.name)} · ${r.pay}</span><button class="btn" onclick="act('${r.id}','accept')">Accept · ₹${r.fare}</button></div>`).join(""):`<div class="empty">Waiting for ride requests…</div>`;
+}
+async function act(id,action){
+  const body={driverId:drv.id,name:drv.name,auto:drv.auto};
+  if(action==="start")body.otp=$("otpIn").value.trim();
+  dErrMsg="";
+  try{await api(`rides/${id}/${action}`,body);if($("otpIn"))$("otpIn").blur();await pollDriver()}
+  catch(e){if($("dErr")){dErrMsg=e.message;$("dErr").textContent=e.message}else{await pollDriver();msgTop(e.message)}}
+}
+function msgTop(m){$("requests").insertAdjacentHTML("afterbegin",`<p class="muted" style="color:var(--warn)">${esc(m)}</p>`)}
+
+// ---------- shell ----------
 function mode(m){$("rider").classList.toggle("hidden",m!=="rider");$("driver").classList.toggle("hidden",m!=="driver");
   $("tRider").classList.toggle("on",m==="rider");$("tDriver").classList.toggle("on",m==="driver");try{location.hash=m}catch{}}
 $("tRider").onclick=()=>mode("rider");$("tDriver").onclick=()=>mode("driver");
-window.addEventListener("storage",render); // sync rider & driver tabs live
-setInterval(render,3000);
-fillCity();mode(location.hash==="#driver"?"driver":"rider");render();
-// resume any ride already assigned to a demo driver
-const cur=rides.find(x=>x.id===myRideId);if(cur&&!cur.cancelled&&cur.status===0)setTimeout(()=>autoAssign(cur.id),20000);
+fillCity();mode(location.hash==="#driver"?"driver":"rider");renderTrip();renderDriver();
+pollRider();pollDriver();
+setInterval(()=>{if(document.hidden)return;pollRider();pollDriver()},3000);
 </script>
 </body>
 </html>
