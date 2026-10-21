@@ -42,6 +42,10 @@ select,input{width:100%;padding:12px;border-radius:10px;border:1px solid var(--l
 .otp{font-size:28px;letter-spacing:6px;font-weight:800}
 .empty{text-align:center;color:var(--muted);padding:20px 0}
 .hidden{display:none}
+.map{height:260px;border-radius:12px;margin-top:12px;border:1px solid var(--line);overflow:hidden;background:var(--bg)}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:6px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.25)}
+.warnbox{margin-top:12px;padding:10px 12px;border-radius:10px;background:var(--bg);border:1px solid var(--warn);color:var(--warn);font-size:14px}
 footer{text-align:center;color:var(--muted);font-size:12px;padding:20px}
 </style>
 </head>
@@ -73,6 +77,7 @@ footer{text-align:center;color:var(--muted);font-size:12px;padding:20px}
     <label for="pay">Payment</label>
     <select id="pay"><option>Cash</option><option>UPI</option></select>
     <div class="fare"><span><span class="muted" id="dist">—</span></span><b id="price">₹0</b></div>
+    <p class="warnbox hidden" id="dueHint"></p>
     <button class="btn" id="bookBtn">Book auto</button>
     <p class="muted" id="err" role="alert"></p>
   </div>
@@ -88,8 +93,15 @@ footer{text-align:center;color:var(--muted);font-size:12px;padding:20px}
       <p class="muted" style="margin:0">Share this OTP with your driver</p>
       <div class="otp" id="otp"></div>
     </div>
+    <div id="rMapWrap" class="hidden">
+      <div id="rMap" class="map" aria-label="Live map"></div>
+      <div class="legend"><span><i style="background:#2b6de8"></i>You</span><span><i style="background:#ffc928"></i>Driver</span><span><i style="background:#1f8a4c"></i>Pickup</span><span><i style="background:#d33"></i>Drop</span></div>
+      <p class="muted" id="rMapInfo"></p>
+    </div>
     <ul class="steps" id="steps"></ul>
+    <p class="warnbox hidden" id="feeMsg"></p>
     <button class="btn ghost" id="cancelBtn">Cancel ride</button>
+    <p class="muted" id="cancelNote"></p>
     <button class="btn hidden" id="newBtn">Book another ride</button>
     <p class="muted" id="tripErr" role="alert"></p>
   </div>
@@ -113,10 +125,16 @@ footer{text-align:center;color:var(--muted);font-size:12px;padding:20px}
   <div class="card">
     <h2>Ride requests</h2>
     <div id="requests"></div>
+    <div id="dMapWrap" class="hidden">
+      <div id="dMap" class="map" aria-label="Live map"></div>
+      <div class="legend"><span><i style="background:#ffc928"></i>You</span><span><i style="background:#2b6de8"></i>Rider</span><span><i style="background:#1f8a4c"></i>Pickup</span><span><i style="background:#d33"></i>Drop</span></div>
+      <p class="muted" id="dMapInfo"></p>
+    </div>
   </div>
   <div class="card">
     <h2>Today's earnings</h2>
     <b id="earn" style="font-size:28px">₹0</b> <span class="muted" id="earnN"></span>
+    <p class="muted" id="earnFee" style="margin:6px 0 0"></p>
   </div>
 </section>
 </main>
@@ -145,6 +163,97 @@ function km(a,b){const R=6371,t=x=>x*Math.PI/180,dLa=t(b[0]-a[0]),dLo=t(b[1]-a[1
   return 2*R*Math.asin(Math.sqrt(h))*1.3;} // 1.3 = road factor
 function fare(d){return Math.round(d<=1.5?30:30+(d-1.5)*15);} // ₹30 min for 1.5 km, ₹15/km after
 
+// ---------- LIVE MAP (Google Maps when GOOGLE_MAPS_API_KEY is set, otherwise OpenStreetMap) ----------
+const COL={blue:"#2b6de8",auto:"#ffc928",pickup:"#1f8a4c",drop:"#d33"};
+let mapLibP=null;
+function loadScript(src){return new Promise((ok,no)=>{const s=document.createElement("script");s.src=src;s.async=true;s.onload=ok;s.onerror=no;document.head.appendChild(s)})}
+function mapLib(){
+  if(!mapLibP)mapLibP=(async()=>{
+    let key="";try{key=(await api("config")).mapsKey||""}catch{}
+    if(key){try{
+      await new Promise((ok,no)=>{window.__gmReady=ok;loadScript(`https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&callback=__gmReady`).catch(no)});
+      return "google"}catch{}}
+    const css=document.createElement("link");css.rel="stylesheet";css.href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";document.head.appendChild(css);
+    await loadScript("https://unpkg.com/leaflet@1.9.4/dist/leaflet.js");return "leaflet";
+  })();
+  return mapLibP;
+}
+class LiveMap{
+  constructor(id){this.id=id;this.m=null;this.mk={};this.keys="";this.moved=0}
+  // points: {name:{pos:[lat,lng],color,label}}; missing/empty pos = hide that marker
+  async update(points){
+    const lib=await mapLib().catch(()=>null);if(!lib)return;
+    const P=Object.fromEntries(Object.entries(points).filter(([,p])=>p&&p.pos));
+    const list=Object.values(P);if(!list.length)return;
+    const el=$(this.id);
+    if(!this.m){
+      this.lib=lib;
+      if(lib==="google"){this.m=new google.maps.Map(el,{center:{lat:list[0].pos[0],lng:list[0].pos[1]},zoom:15,disableDefaultUI:true,zoomControl:true,gestureHandling:"greedy",clickableIcons:false});
+        this.m.addListener("dragstart",()=>this.moved=Date.now())}
+      else{this.m=L.map(el).setView(list[0].pos,15);
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19,attribution:"© OpenStreetMap"}).addTo(this.m);
+        this.m.on("dragstart",()=>this.moved=Date.now())}
+    }
+    if(this.lib==="leaflet")this.m.invalidateSize();
+    for(const k of Object.keys(this.mk))if(!P[k]){this.lib==="google"?this.mk[k].setMap(null):this.mk[k].remove();delete this.mk[k]}
+    for(const [k,p] of Object.entries(P)){
+      if(this.mk[k]){this.lib==="google"?this.mk[k].setPosition({lat:p.pos[0],lng:p.pos[1]}):this.mk[k].setLatLng(p.pos);continue}
+      this.mk[k]=this.lib==="google"
+        ?new google.maps.Marker({map:this.m,position:{lat:p.pos[0],lng:p.pos[1]},title:p.label,zIndex:p.z||1,
+            icon:{path:google.maps.SymbolPath.CIRCLE,scale:p.big?10:7,fillColor:p.color,fillOpacity:1,strokeColor:"#fff",strokeWeight:3}})
+        :L.circleMarker(p.pos,{radius:p.big?10:7,color:"#fff",weight:3,fillColor:p.color,fillOpacity:1}).bindTooltip(p.label).addTo(this.m);
+    }
+    // Keep everyone in view, unless the user has just panned the map themselves.
+    const keys=Object.keys(P).sort().join();
+    if(keys!==this.keys||Date.now()-this.moved>30000){this.keys=keys;this.fit(list)}
+  }
+  fit(list){
+    if(this.lib==="google"){
+      if(list.length===1){this.m.setCenter({lat:list[0].pos[0],lng:list[0].pos[1]});return}
+      const b=new google.maps.LatLngBounds();list.forEach(p=>b.extend({lat:p.pos[0],lng:p.pos[1]}));this.m.fitBounds(b,40);
+      if(this.m.getZoom()>17)this.m.setZoom(17);
+    }else{
+      if(list.length===1){this.m.setView(list[0].pos,16);return}
+      this.m.fitBounds(L.latLngBounds(list.map(p=>p.pos)),{padding:[30,30],maxZoom:17});
+    }
+  }
+}
+const rMap=new LiveMap("rMap"),dMap=new LiveMap("dMap");
+
+// ---------- LIVE LOCATION SHARING ----------
+const geo={watch:null,pos:null,err:"",ctx:{},sent:{}};
+function share(role,ctx){ // ctx = {id, body} while this person is on a live ride, else null
+  geo.ctx[role]=ctx;
+  const any=Object.values(geo.ctx).some(Boolean);
+  if(!navigator.geolocation){geo.err=any?"Location isn't available on this device.":"";return}
+  if(any&&geo.watch===null){
+    geo.watch=navigator.geolocation.watchPosition(p=>{geo.pos=[p.coords.latitude,p.coords.longitude];geo.err="";sendLoc()},
+      e=>{geo.err=e.code===1?"Allow location access so you show up on the map.":"Can't get your location right now."},
+      {enableHighAccuracy:true,maximumAge:5000,timeout:20000});
+  }else if(!any&&geo.watch!==null){navigator.geolocation.clearWatch(geo.watch);geo.watch=null;geo.pos=null}
+  sendLoc();
+}
+function sendLoc(){
+  if(!geo.pos)return;
+  for(const [role,c] of Object.entries(geo.ctx)){
+    if(!c)continue;const k=role+c.id;
+    if(Date.now()-(geo.sent[k]||0)<4000)continue;geo.sent[k]=Date.now();
+    api(`rides/${c.id}/location`,{...c.body,lat:geo.pos[0],lng:geo.pos[1]}).catch(()=>{});
+  }
+}
+const ll=l=>l?[l.lat,l.lng]:null;
+function meters(a,b){const R=6371000,t=x=>x*Math.PI/180,dLa=t(b[0]-a[0]),dLo=t(b[1]-a[1]);
+  const h=Math.sin(dLa/2)**2+Math.cos(t(a[0]))*Math.cos(t(b[0]))*Math.sin(dLo/2)**2;return 2*R*Math.asin(Math.sqrt(h));}
+const fmtDist=m=>m<1000?`${Math.max(10,Math.round(m/10)*10)} m`:`${(m/1000).toFixed(1)} km`;
+const place=(r,p)=>(CITIES[r.city]||{})[p]||null;
+const mmss=ms=>{const s=Math.max(0,Math.ceil(ms/1000));return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`};
+// Text about the ₹20 cancellation fee. who = "rider" | "driver"
+function feeText(r,who){
+  if(r.cancelFee)return `Cancelling now costs ₹${r.cancelFee}: ${r.cancelReason==="near"?(who==="rider"?"your driver is within 200 m":"you're within 200 m of the rider"):(who==="rider"?"it's been over 2 minutes since the driver accepted":"it's been over 2 minutes since you accepted")}.`;
+  if(r.status===1&&r.freeUntil)return `Free cancellation for ${mmss(r.freeUntil-Date.now())} more (or until ${who==="rider"?"the driver is":"you're"} within 200 m).`;
+  return "";
+}
+
 // ---------- RIDER ----------
 let mine=load("autosathi.myride",null); // {id, token}
 let ride=null, rideHistory=load("autosathi.history",[]);
@@ -152,9 +261,11 @@ function fillCity(){$("city").innerHTML=Object.keys(CITIES).map(x=>`<option>${x}
 function fillPlaces(){const p=Object.keys(CITIES[$("city").value]).map(x=>`<option>${x}</option>`).join("");
   $("from").innerHTML=p;$("to").innerHTML=p;$("to").selectedIndex=1;quote();}
 function quote(){const C=CITIES[$("city").value],f=$("from").value,t=$("to").value;
+  const due=load("autosathi.due",0);
+  $("dueHint").classList.toggle("hidden",!due);$("dueHint").textContent=due?`₹${due} cancellation fee from an earlier ride will be added to this fare.`:"";
   if(f===t){$("dist").textContent="Pick a different drop";$("price").textContent="₹0";$("bookBtn").disabled=true;return}
   const d=km(C[f],C[t]);$("dist").textContent=`${d.toFixed(1)} km · ~${Math.max(5,Math.round(d*3.5))} min`;
-  $("price").textContent="₹"+fare(d);$("bookBtn").disabled=false;}
+  $("price").textContent="₹"+(fare(d)+due);$("bookBtn").disabled=false;}
 $("city").onchange=fillPlaces;["from","to"].forEach(i=>$(i).onchange=quote);
 $("name").value=load("autosathi.name","");$("phone").value=load("autosathi.phone","");
 
@@ -165,12 +276,16 @@ $("bookBtn").onclick=async()=>{
   const C=CITIES[$("city").value],d=km(C[$("from").value],C[$("to").value]);
   $("bookBtn").disabled=true;$("err").textContent="";
   try{const j=await api("rides",{city:$("city").value,from:$("from").value,to:$("to").value,km:+d.toFixed(1),fare:fare(d),pay:$("pay").value,name,phone});
-    save("autosathi.name",name);save("autosathi.phone",phone);
+    save("autosathi.name",name);save("autosathi.phone",phone);save("autosathi.due",0);
     mine={id:j.ride.id,token:j.token};save("autosathi.myride",mine);ride=j.ride;renderTrip();}
   catch(e){$("err").textContent=e.message}finally{$("bookBtn").disabled=false}
 };
-$("cancelBtn").onclick=async()=>{try{ride=await api(`rides/${mine.id}/cancel`,{token:mine.token});renderTrip()}catch(e){alertTrip(e.message)}};
-$("newBtn").onclick=()=>{mine=null;ride=null;save("autosathi.myride",null);renderTrip()};
+$("cancelBtn").onclick=async()=>{
+  if(ride&&ride.cancelFee&&!confirm(feeText(ride,"rider")+" It will be added to your next ride. Cancel anyway?"))return;
+  try{ride=await api(`rides/${mine.id}/cancel`,{token:mine.token});
+    if(ride.riderFee)save("autosathi.due",load("autosathi.due",0)+ride.riderFee);
+    renderTrip();quote()}catch(e){alertTrip(e.message)}};
+$("newBtn").onclick=()=>{mine=null;ride=null;save("autosathi.myride",null);renderTrip();quote()};
 function alertTrip(m){$("tripErr").textContent=m}
 async function pollRider(){
   if(!mine)return;
@@ -182,25 +297,42 @@ async function pollRider(){
 function renderTrip(){
   const r=mine&&ride;
   $("bookCard").classList.toggle("hidden",!!mine);$("tripCard").classList.toggle("hidden",!mine);
-  renderHistory();if(!r)return;
+  renderHistory();
+  const live=!!(r&&!r.cancelled&&r.driver&&(r.status===1||r.status===2));
+  share("rider",live?{id:r.id,body:{token:mine.token}}:null);
+  $("rMapWrap").classList.toggle("hidden",!live);
+  if(!r)return;
   $("tripErr").textContent="";
-  $("tripRoute").textContent=`${r.from} → ${r.to}, ${r.city} · ${r.km} km · ₹${r.fare} (${r.pay})`;
+  $("tripRoute").textContent=`${r.from} → ${r.to}, ${r.city} · ${r.km} km · ₹${r.total??r.fare} (${r.pay})`+(r.due?` · includes ₹${r.due} earlier cancellation fee`:"");
   const done=r.cancelled||r.status===3;
   $("tripPill").textContent=r.cancelled?"Cancelled":STEPS[r.status];$("tripPill").className="pill "+(r.cancelled?"warn":r.status===3?"ok":"");
   $("driverBox").classList.toggle("hidden",!r.driver||done);
   if(r.driver){$("dName").textContent=r.driver.name;$("dAuto").textContent=r.driver.auto;$("otp").textContent=r.otp||""}
   $("waitHint").classList.toggle("hidden",r.status!==0||done);
+  $("waitHint").textContent=r.driverCancelled?"Your driver cancelled. Finding you another driver…":"Waiting for a nearby driver to accept…";
   $("steps").innerHTML=r.cancelled?"":STEPS.map((s,i)=>`<li class="${i<r.status||r.status===3?"done":i===r.status?"now":""}">${s}</li>`).join("");
   $("cancelBtn").classList.toggle("hidden",done||r.status>=2);$("newBtn").classList.toggle("hidden",!done);
+  $("cancelNote").textContent=done||r.status>=2?"":r.status===0?"Free to cancel until a driver accepts.":feeText(r,"rider");
+  $("feeMsg").classList.toggle("hidden",!(r.cancelled&&r.riderFee));
+  $("feeMsg").textContent=r.riderFee?`₹${r.riderFee} cancellation fee charged. It will be added to your next ride.`:"";
+  if(live){
+    const me=geo.pos,drv=ll(r.driverLoc),pick=place(r,r.from);
+    rMap.update({pickup:{pos:pick,color:COL.pickup,label:"Pickup: "+r.from},drop:{pos:place(r,r.to),color:COL.drop,label:"Drop: "+r.to},
+      you:{pos:me,color:COL.blue,label:"You",big:true,z:3},driver:{pos:drv,color:COL.auto,label:r.driver.name+" · "+r.driver.auto,big:true,z:4}});
+    let info;
+    if(r.status===1)info=drv?`Driver is ${fmtDist(r.distance??meters(drv,me||pick))} away`:"Waiting for your driver's location…";
+    else info=`Ride in progress · heading to ${r.to}`;
+    $("rMapInfo").textContent=info+(geo.err?" · "+geo.err:"");
+  }
 }
 function renderHistory(){
-  $("history").innerHTML=rideHistory.length?rideHistory.slice(0,8).map(r=>`<div class="req"><b>${esc(r.from)} → ${esc(r.to)}</b><br><span class="muted">${new Date(r.at).toLocaleString("en-IN",{dateStyle:"medium",timeStyle:"short"})} · ₹${r.fare}</span> <span class="pill ${r.cancelled?"warn":"ok"}">${r.cancelled?"Cancelled":"Completed"}</span></div>`).join(""):`<div class="empty">No rides yet</div>`;
+  $("history").innerHTML=rideHistory.length?rideHistory.slice(0,8).map(r=>`<div class="req"><b>${esc(r.from)} → ${esc(r.to)}</b><br><span class="muted">${new Date(r.at).toLocaleString("en-IN",{dateStyle:"medium",timeStyle:"short"})} · ${r.cancelled?(r.riderFee?`₹${r.riderFee} cancellation fee`:"No charge"):"₹"+(r.total??r.fare)}</span> <span class="pill ${r.cancelled?"warn":"ok"}">${r.cancelled?"Cancelled":"Completed"}</span></div>`).join(""):`<div class="empty">No rides yet</div>`;
 }
 
 // ---------- DRIVER ----------
 let drv=load("autosathi.driver.v2",null)||{id:crypto.randomUUID?crypto.randomUUID():String(Math.random()).slice(2),name:"",auto:"",online:false};
 save("autosathi.driver.v2",drv);
-let dRides=[],dErrMsg="";
+let dRides=[],dErrMsg="",dTop="";
 $("dn").value=drv.name;$("dv").value=drv.auto;$("online").checked=drv.online;
 ["dn","dv"].forEach(i=>$(i).oninput=()=>{drv.name=$("dn").value;drv.auto=$("dv").value.toUpperCase();save("autosathi.driver.v2",drv)});
 $("online").onchange=()=>{if($("online").checked&&(!drv.name.trim()||!drv.auto.trim())){$("online").checked=false;msg("Add your name and auto number first.");return}
@@ -213,21 +345,45 @@ async function pollDriver(){
 function renderDriver(){
   const minez=dRides.filter(r=>r.driver&&r.driver.name===drv.name&&r.driver.auto===drv.auto.toUpperCase());
   const paid=minez.filter(r=>r.status===3&&!r.cancelled);
-  $("earn").textContent="₹"+paid.reduce((s,r)=>s+r.fare,0);$("earnN").textContent=`${paid.length} ride${paid.length===1?"":"s"} in last 24h`;
+  const fees=dRides.filter(r=>r.iCancelled).reduce((s,r)=>s+(r.myFee||0),0);
+  $("earn").textContent="₹"+(paid.reduce((s,r)=>s+(r.total??r.fare),0)-fees);$("earnN").textContent=`${paid.length} ride${paid.length===1?"":"s"} in last 24h`;
+  $("earnFee").textContent=fees?`₹${fees} in cancellation fees deducted`:"";
+  const active=drv.online&&minez.find(r=>!r.cancelled&&r.status>0&&r.status<3);
+  share("driver",active?{id:active.id,body:{driverId:drv.id}}:null);
+  $("dMapWrap").classList.toggle("hidden",!active);
+  if(active){
+    const rl=ll(active.riderLoc),pick=place(active,active.from);
+    dMap.update({pickup:{pos:pick,color:COL.pickup,label:"Pickup: "+active.from},drop:{pos:place(active,active.to),color:COL.drop,label:"Drop: "+active.to},
+      rider:{pos:active.status===1?rl:null,color:COL.blue,label:active.name,big:true,z:3},you:{pos:geo.pos,color:COL.auto,label:"You",big:true,z:4}});
+    let info;
+    if(active.status===1)info=rl?`Rider is ${fmtDist(active.distance??meters(rl,geo.pos||pick))} away`:`Rider hasn't shared location yet · head to ${active.from}`;
+    else info=`Ride in progress · drop at ${active.to}`;
+    $("dMapInfo").textContent=info+(geo.err?" · "+geo.err:"");
+  }
   if(!drv.online){msg("You're offline. Go online to see ride requests.");return}
   if(document.activeElement&&document.activeElement.id==="otpIn")return; // don't wipe OTP while typing
-  const active=minez.find(r=>!r.cancelled&&r.status>0&&r.status<3);
-  if(active){$("requests").innerHTML=`<div class="req"><span class="pill">${STEPS[active.status]}</span><p><b>${esc(active.name)}</b> · <a href="tel:${esc(active.phone)}">${esc(active.phone)}</a><br>${esc(active.from)} → ${esc(active.to)} · ₹${active.fare} (${active.pay})</p>
-    ${active.status===1?`<label for="otpIn">Rider's OTP</label><input id="otpIn" inputmode="numeric" maxlength="4"><button class="btn" onclick="act('${active.id}','start')">Start ride</button>`:`<button class="btn" onclick="act('${active.id}','complete')">Complete ride · collect ₹${active.fare}</button>`}<p class="muted" id="dErr" style="color:var(--warn)">${esc(dErrMsg)}</p></div>`;return}
-  const open=dRides.filter(r=>!r.cancelled&&r.status===0);
-  $("requests").innerHTML=open.length?open.map(r=>`<div class="req"><b>${esc(r.from)} → ${esc(r.to)}</b> <span class="pill">${esc(r.city)}</span><br><span class="muted">${r.km} km · ${esc(r.name)} · ${r.pay}</span><button class="btn" onclick="act('${r.id}','accept')">Accept · ₹${r.fare}</button></div>`).join(""):`<div class="empty">Waiting for ride requests…</div>`;
+  const top=dTop?`<p class="warnbox">${esc(dTop)}</p>`:"";
+  if(active){$("requests").innerHTML=top+`<div class="req"><span class="pill">${STEPS[active.status]}</span><p><b>${esc(active.name)}</b> · <a href="tel:${esc(active.phone)}">${esc(active.phone)}</a><br>${esc(active.from)} → ${esc(active.to)} · ₹${active.total??active.fare} (${active.pay})</p>
+    ${active.status===1?`<label for="otpIn">Rider's OTP</label><input id="otpIn" inputmode="numeric" maxlength="4"><button class="btn" onclick="act('${active.id}','start')">Start ride</button>
+      <button class="btn ghost" onclick="drvCancel('${active.id}')">Cancel ride</button><p class="muted">${esc(feeText(active,"driver"))}</p>`
+    :`<button class="btn" onclick="act('${active.id}','complete')">Complete ride · collect ₹${active.total??active.fare}</button>`}<p class="muted" id="dErr" style="color:var(--warn)">${esc(dErrMsg)}</p></div>`;return}
+  const open=dRides.filter(r=>!r.cancelled&&r.status===0&&!r.iCancelled);
+  $("requests").innerHTML=top+(open.length?open.map(r=>`<div class="req"><b>${esc(r.from)} → ${esc(r.to)}</b> <span class="pill">${esc(r.city)}</span><br><span class="muted">${r.km} km · ${esc(r.name)} · ${r.pay}</span><button class="btn" onclick="act('${r.id}','accept')">Accept · ₹${r.total??r.fare}</button></div>`).join(""):`<div class="empty">Waiting for ride requests…</div>`);
+}
+async function drvCancel(id){
+  const r=dRides.find(x=>x.id===id);
+  if(!confirm(r&&r.cancelFee?feeText(r,"driver")+" It will be deducted from your earnings. Cancel anyway?":"Cancel this ride? The rider will be matched with another driver."))return;
+  const fee=r&&r.cancelFee;
+  if(!await act(id,"cancel"))return;
+  dTop=`Ride cancelled.${fee?` ₹${fee} cancellation fee deducted from your earnings.`:" No fee charged."}`;
+  setTimeout(()=>{dTop="";renderDriver()},8000);renderDriver();
 }
 async function act(id,action){
   const body={driverId:drv.id,name:drv.name,auto:drv.auto};
   if(action==="start")body.otp=$("otpIn").value.trim();
   dErrMsg="";
-  try{await api(`rides/${id}/${action}`,body);if($("otpIn"))$("otpIn").blur();await pollDriver()}
-  catch(e){if($("dErr")){dErrMsg=e.message;$("dErr").textContent=e.message}else{await pollDriver();msgTop(e.message)}}
+  try{await api(`rides/${id}/${action}`,body);if($("otpIn"))$("otpIn").blur();await pollDriver();return true}
+  catch(e){if($("dErr")){dErrMsg=e.message;$("dErr").textContent=e.message}else{await pollDriver();msgTop(e.message)}return false}
 }
 function msgTop(m){$("requests").insertAdjacentHTML("afterbegin",`<p class="muted" style="color:var(--warn)">${esc(m)}</p>`)}
 
@@ -237,7 +393,7 @@ function mode(m){$("rider").classList.toggle("hidden",m!=="rider");$("driver").c
 $("tRider").onclick=()=>mode("rider");$("tDriver").onclick=()=>mode("driver");
 fillCity();mode(location.hash==="#driver"?"driver":"rider");renderTrip();renderDriver();
 pollRider();pollDriver();
-setInterval(()=>{if(document.hidden)return;pollRider();pollDriver()},3000);
+setInterval(()=>{if(document.hidden)return;pollRider();pollDriver();sendLoc()},3000);
 </script>
 </body>
 </html>
